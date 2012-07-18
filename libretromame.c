@@ -6,12 +6,13 @@
  ************************************************************************** **/
 
 #include <libmame/libmame.h>
+#include <pthread.h>
 #include "libretro.h"
 
 #define LIBRARY_VERSION "1.0.0"
 
 /* ************************************************************************ */
-/* Forward declaration of run game callbacks
+/* Forward declaration of libmame run game callbacks
 /* ************************************************************************ */
 static void StatusTextCb(const char *format, va_list args, void *callback_data);
 static void StartingUpCb(LibMame_StartupPhase phase, int pct_complete,
@@ -29,7 +30,7 @@ static void PausedCb(void *callback_data);
 
 
 /* ************************************************************************ */
-/* Global State - unavoidable due to the libretro API */
+/* Global State
 /* ************************************************************************ */
 
 static retro_environment_t retroEnvironmentG;
@@ -39,15 +40,23 @@ static retro_audio_sample_batch_t retroAudioSampleBatchG;
 static retro_input_poll_t retroInputPollG;
 static retro_input_state_t retroInputStateG;
 
+/* Global mutex and condition variables controlling runner thread */
+static pthread_mutex_t mutexG;
+static pthread_cond_t toRunnerCondG, fromRunnerCondG;
+
 static LibMame_RunningGame *runningGameG;
+static bool runningGameStopG;
 static int runningGameNumberG = -1;
 /* Values of the most recently received video frame */
 static uint32_t runningGameWidthG, runningGameHeightG;
 /* Values of the most recently received audio frame */
 static int runningGameSampleRateG;
 
+/* Next video frame */
+static uint16_t videoFrameG[1000 * 1000];
+
 /* Options to use when running a game */
-static LibMame_RunGameOptions runGameOptionsG:
+static LibMame_RunGameOptions runGameOptionsG;
 /* libmame callbacks */
 LibMame_RunGameCallbacks runGameCallbacksG =
 {
@@ -106,14 +115,35 @@ void retro_init()
 {
     /* retro_init() assumes success, so so will we */
     (void) LibMame_Initialize();
+
+    /* it is nonsensical for these to fail */
+    (void) pthread_mutex_init(&mutexG, 0);
+    (void) pthread_cond_init(&toRunnerCondG, 0);
+    (void) pthread_cond_init(&fromRunnerCondG, 0);
+
+    /* Set up the libmame options */
+    LibMame_Get_Default_RunGameOptions(&runGameOptionsG);
+    runGameOptionsG.auto_frame_skip = 0;
+    runGameOptionsG.throttle = 0;
+    runGameOptionsG.sleep = 0;
+    runGameOptionsG.sound = 1;
+    runGameOptionsG.skip_gameinfo_screens = 1;
+    runGameOptionsG.quiet_startup = 1;
+    runGameOptionsG.use_backdrops = 0;
+    runGameOptionsG.use_overlays = 0;
+    runGameOptionsG.use_bezels = 0;
 }
 
 
 void retro_deinit()
 {
-    /* Not going to bother to enforce that retro_init() have occurred
+    /* Not going to bother to enforce that retro_init() has occurred
        successfully */
     Libmame_Deinitialize();
+
+    (void) pthread_mutex_destroy(&mutexG);
+    (void) pthread_cond_destroy(&toRunnerCondG);
+    (void) pthread_cond_destroy(&fromRunnerCondG);
 }
 
 
@@ -159,17 +189,50 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 
 void retro_set_controller_port_device(unsigned port, unsigned device)
 {
+    /* Not sure what this is even supposed to do */
+    (void) port, (void) device;
+}
+
+
+static void *runner_main(void *)
+{
+    if (runningGameNumberG != -1) {
+        LibMame_RunGameStatus status = LibMame_RunGame
+            (runningGameNumberG, true, &runGameOptionsG,
+             &runGameCallbacksG, NULL);
+        switch (status) {
+        case LibMame_RunGameStatus_Success:
+            break;
+        case LibMame_RunGameStatus_InvalidGameNum:
+            printf("Invalid game\n");
+            break;
+        case LibMame_RunGameStatus_FailedValidityCheck:
+            printf("Failed validity check\n");
+            break;
+        case LibMame_RunGameStatus_MissingFiles:
+            printf("Missing files\n");
+            break;
+        case LibMame_RunGameStatus_NoSuchGame:
+            printf("No such game\n");
+            break;
+        case LibMame_RunGameStatus_InvalidConfig:
+            printf("Invalid config\n");
+            break;
+        case LibMame_RunGameStatus_GeneralError:
+            printf("General error\n");
+        }
+    }
+
+    runningGameNumberG = -1;
+
+    pthread_cond_signal(&fromRunnerThreadG);
 }
 
 
 void retro_reset()
 {
     resetG = true;
-}
-
-
-void retro_run()
-{
+    pthread_cond_signal(&toRunnerCondG);
 }
 
 
@@ -209,14 +272,6 @@ void retro_cheat_set(unsigned index, bool enabled, const char *code)
 }
 
 
-bool retro_load_game(const struct retro_game_info *game)
-{
-    /* Extract the rompath and game name from the path */
-
-    /* If a game is running, schedule an exit */
-}
-
-
 bool retro_load_game_special(unsigned int game_type,
                              const struct retro_game_info *info,
                              size_t num_info)
@@ -227,10 +282,92 @@ bool retro_load_game_special(unsigned int game_type,
 }
 
 
+bool retro_load_game(const struct retro_game_info *game)
+{
+    /* Extract the rompath and game name from the path */
+    char *c = game->path;
+    
+    char gamename[256];
+    
+    while (*c && (*c != '/') && (*c != '\\')) {
+        c += 1;
+    }
+    if (*c) {
+        c += 1;
+        snprintf(runGameOptionsG.rom_path, sizeof(runGameOptionsG.rom_path),
+                 "%.*s", c - game->path, game->path);
+        char *g = c;
+        while (*c && (*c != '.')) {
+            c += 1;
+        }
+        snprintf(gamename, sizeof(gamename), "%.*s", c - g, g);
+    }
+    else {
+        /* local file */
+        rompath[0] = '.';
+        rompath[1] = 0;
+        snprintf(gamename, sizeof(gamename), "%s", game->path);
+    }
+    
+    /* Eliminate file extension and tolower it */
+    c = gamename;
+    while (*c) {
+        if (*c == '.') {
+            *c = 0;
+            break;
+        }
+        else {
+            *c = tolower(*c);
+            c += 1;
+        }
+    }
+    
+    /* Look up the game */
+    runningGameNumberG = LibMame_Get_Game_Number(gamename);
+    
+    if (runningGameNumberG == -1) {
+        return false;
+    }
+
+    /* Clear the stop indicator */
+    runningGameStopG = false;
+
+    /* Start the runner thread */
+    pthread_t dontcare;
+    return (pthread_create(&dontcare, 0, runner_main, 0) == 0);
+}
+
+
+void retro_run()
+{
+    pthread_mutex_lock(&mutexG);
+
+    /* Signal the runner thread to continue for one frame */
+    pthread_cond_signal(&toRunnerCondG);
+
+    /* Wait until it signals that it is done and return */
+    pthread_cond_wait(&fromRunnerCondG, &mutexG);
+}
+
+
 void retro_unload_game()
 {
-    /* Not supported yet */
-    unloadGameG = true;
+    pthread_mutex_lock(&mutexG);
+
+    if (runningGameNumberG != -1) {
+        /* Signal to the runner thread to exit */
+        runningGameStopG = true;
+        pthread_cond_signal(&toRunnerCondG, &mutexG);
+
+        /* And wait for the thread to exit */
+        while (runningGameNumberG != -1) {
+            pthread_cond_wait(&fromRunnerCondG, &mutexG);
+        }
+
+        /* Reset game-related values */
+        runningGameWidthG = runningGameHeightG = 0;
+        runningGameSampleRateG = 0;
+    }
 }
 
 
@@ -297,27 +434,122 @@ static void PollAllControlsStateCb(LibMame_AllControlsState *all_states,
 {
     (void) callback_data;
 
+    if (!retroInputPollG || !retroInputStateG) {
+        return;
+    }
+
     /* Ask libretro front end to latch all controller input */
     retroInputPollG();
 
     /* Could be sophisticated and only query for those controls that the
        running game needs, but for simplicity just query for everything */
-    
+    unsigned int playerCount = 
+        LibMame_Get_Game_MaxSimultaneousPlayers(runningGameNumberG);
+
+    /* And, use a fairly simple fixed input mapping */
+    for (unsigned int i = 0; i < playerCount; i++) {
+        /* OK, not sure how to map anything here.  libretro names a
+           RETRO_DEVICE_KEYBOARD, which is the only one I am likely to
+           be able to use during development, but doesn't say anything about
+           what key ids there are */
+    }
 }
 
 
 static void UpdateVideoCb(const LibMame_RenderPrimitive *render_primitive_list,
                           void *callback_data)
 {
-    (void) callback_data;
+    if (!retroVideoRefreshG) {
+        return;
+    }
+
+    const LibMame_RenderPrimitive *prim = render_primitive_list;
+
+    /* Just render pixmaps; don't worry about vector games as to support them
+       properly, libretro needs vector graphics support in its API.  And just
+       render the first pixmap, as multi-quad games as they are pretty rare,
+       usually gambling machines, and doing the compositing in software would
+       be dumb */
+    while (prim && ((prim->type != LibMame_RenderPrimitiveType_Quad) ||
+                    !LIBMAME_RENDERFLAGS_SCREEN_TEXTURE(prim->flags))) {
+        prim = prim->next;
+    }
     
+    if (!prim) {
+        return;
+    }
+    
+    /* This should never happen; but if the texture is too big, ignore it */
+    if ((prim->texture.width * prim->texture.height) > (1000 * 1000)) {
+        return;
+    }
+
+    runningGameWidthG = prim->texture.width;
+    runningGameHeightG = prim->texture.height;
+
+    switch (LIBMAME_RENDERFLAGS_TEXTURE_FORMAT(prim.flags)) {
+    case LibMame_TextureFormat_Palette16:
+    case LibMame_TextureFormat_PaletteA16: {
+        /* Convert */
+        uint16_t *dest = videoFrameG;
+        uint16_t *src = (uint16_t *) prim->texture.base;
+        int rowdiff = prim->texture.rowpixels - prim->texture.width;
+        for (uint32_t y = 0; y < prim->texture.height; y++) {
+            for (uint32_t x = 0; x < prim>texture.width; x++) {
+                *dest++ = prim.texture.palette[*src++];
+            }
+            src += rowdiff;
+        }
+        break;
+    }
+        
+    case LibMame_TextureFormat_RGB32:
+    case LibMame_TextureFormat_ARGB32:{
+        /* Convert */
+        uint16_t *dest = videoFrameG;
+        uint32_t *src = (uint32_t *) prim->texture.base;
+        int rowdiff = prim->texture.rowpixels - prim->texture.width;
+        for (uint32_t y = 0; y < prim->texture.height; y++) {
+            for (uint32_t x = 0; x < prim>texture.width; x++) {
+                uint32_t xrgb = prim.texture.palette[*src++];
+                *dest++ = ((((xrgb >> 16) & 0x3f) << 10) |
+                           (((xrgb >>  8) & 0x3f) <<  5) |
+                           (((xrgb >>  0) & 0x3f) <<  0));
+            }
+            src += rowdiff;
+        }
+        break;
+    }
+    case LibMame_TextureFormat_YUY16:
+        /* Unimplemented */
+        return;
+    case LibMame_TextureFormat_Undefined:
+        /* Should never happen */
+        return;
+    default:
+        /* Should never happen */
+        return;
+    }
+
+    (retroVideoRefreshG)(videoFrameG, runningGameWidthG, runningGameHeightG,
+                         2 * runningGameWidthG);
 }
 
 
-static void UpdateAudioCb(int sample_rate, int samples_this_frame, 
+static void UpdateAudioCb(int sample_rate, int frame_count, 
                           const int16_t *buffer, void *callback_data)
 {
-    (void) callback_data;
+    runningGameSampleRateG = sample_rate;
+
+    if (retroAudioSampleBatchG) {
+        (retroAudioSampleBatchG)(buffer, samples_this_frame);
+    }
+    else if (retroAudioSampleG) {
+        for (int i = 0; i < frame_count; i++) {
+            (retroAudioSampleG)(buffer, &(buffer[1]));
+            buffer = &(buffer[2]);
+        }
+    }
 }
 
 
@@ -331,14 +563,23 @@ static void MakeRunningGameCallsCb(void *callback_data)
 {
     (void) callback_data;
 
-    if (resetG) {
-        LibMame_RunningGame_Schedule_Hard_Reset(runningGameG);
-        resetG = false;
-    }
+    pthread_mutex_lock(&mutexG);
 
-    if (unloadGameG) {
+    /* Signal done with this frame */
+    pthread_cond_signal(&fromRunnerCondG);
+
+    /* Now wait to be told to go again */
+    pthread_cond_wait(&toRunnerCondG, &mutexG);
+
+    /* If it's time to exit this game, do so */
+    if (runningGameStopG) {
+        /* Time to exit */
         LibMame_RunningGame_Schedule_Exit(runningGameG);
-        unloadGameG = false;
+    }
+    /* Else if a reset has been requested, do so */
+    else if (resetG) {
+        LibMame_RunningGame_Schedule_Soft_Reset(runningGameG);
+        resetG = false;
     }
 }
 
